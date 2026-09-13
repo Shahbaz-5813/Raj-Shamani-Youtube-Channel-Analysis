@@ -1,0 +1,115 @@
+# Raj Shamani YouTube Channel Scraper - Final Version
+# Run this in Jupyter Notebook
+
+import pandas as pd
+import isodate
+from datetime import datetime
+from googleapiclient.discovery import build
+
+# ============ CONFIG ============
+API_KEY = "AIzaSyCNMvRjqd7FdkrsNZFIDng8mXJ4MyayDIg"
+CHANNEL_ID = "UCzwCEE_PchiBULMnAJqhGVg"   # direct channel ID, no resolving needed
+MIN_DURATION_SECONDS = 300       # 5 minutes -> "long video" threshold
+MAX_VIDEOS = 100
+OUTPUT_CSV = "raj_shamani_last_100_long_videos.csv"
+# =================================
+
+youtube = build("youtube", "v3", developerKey=API_KEY)
+
+
+def get_uploads_playlist_id(channel_id: str) -> str:
+    request = youtube.channels().list(part="contentDetails,statistics,snippet", id=channel_id)
+    response = request.execute()
+    item = response["items"][0]
+    uploads_playlist_id = item["contentDetails"]["relatedPlaylists"]["uploads"]
+    print(f"Channel: {item['snippet']['title']}")
+    print(f"Subscribers: {item['statistics'].get('subscriberCount', 'N/A')}")
+    print(f"Total videos: {item['statistics'].get('videoCount', 'N/A')}")
+    print(f"Total channel views: {item['statistics'].get('viewCount', 'N/A')}")
+    return uploads_playlist_id
+
+
+def get_all_video_ids(uploads_playlist_id: str, max_needed: int = 300):
+    """Pull more than needed since we'll filter out Shorts afterward."""
+    video_ids = []
+    next_page_token = None
+    while len(video_ids) < max_needed:
+        request = youtube.playlistItems().list(
+            part="contentDetails",
+            playlistId=uploads_playlist_id,
+            maxResults=50,
+            pageToken=next_page_token
+        )
+        response = request.execute()
+        video_ids += [item["contentDetails"]["videoId"] for item in response["items"]]
+        next_page_token = response.get("nextPageToken")
+        if not next_page_token:
+            break
+    return video_ids
+
+
+def get_video_details(video_ids: list):
+    """Fetch full details in batches of 50 (API limit per call)."""
+    all_data = []
+    for i in range(0, len(video_ids), 50):
+        batch = video_ids[i:i + 50]
+        request = youtube.videos().list(
+            part="snippet,contentDetails,statistics",
+            id=",".join(batch)
+        )
+        response = request.execute()
+        for item in response["items"]:
+            duration_sec = isodate.parse_duration(item["contentDetails"]["duration"]).total_seconds()
+            if duration_sec < MIN_DURATION_SECONDS:
+                continue  # skip Shorts / short videos
+
+            stats = item.get("statistics", {})
+            snippet = item["snippet"]
+
+            all_data.append({
+                "video_id": item["id"],
+                "title": snippet.get("title"),
+                "description": snippet.get("description"),
+                "tags": ", ".join(snippet.get("tags", [])),
+                "published_at": snippet.get("publishedAt"),
+                "duration_seconds": duration_sec,
+                "duration_minutes": round(duration_sec / 60, 2),
+                "views": int(stats.get("viewCount", 0)),
+                "likes": int(stats.get("likeCount", 0)),
+                "comments": int(stats.get("commentCount", 0)),
+                "url": f"https://www.youtube.com/watch?v={item['id']}"
+            })
+    return all_data
+
+
+def main():
+    uploads_playlist_id = get_uploads_playlist_id(CHANNEL_ID)
+
+    print("\nFetching video IDs...")
+    video_ids = get_all_video_ids(uploads_playlist_id, max_needed=700)
+    print(f"Fetched {len(video_ids)} candidate video IDs")
+
+    print("\nFetching video details and filtering long videos...")
+    video_data = get_video_details(video_ids)
+    print(f"Found {len(video_data)} long videos (>{MIN_DURATION_SECONDS/60:.0f} min)")
+
+    df = pd.DataFrame(video_data)
+    df["published_at"] = pd.to_datetime(df["published_at"])
+    df = df.sort_values("published_at", ascending=False).reset_index(drop=True)
+
+    # Keep only the most recent MAX_VIDEOS
+    df = df.head(MAX_VIDEOS)
+
+    if len(df) < MAX_VIDEOS:
+        print(f"\nNote: only found {len(df)} long videos (>{MIN_DURATION_SECONDS/60:.0f} min) among the fetched candidates.")
+        print("If you need the full 100, increase max_needed in get_all_video_ids() further and re-run.")
+
+    df.to_csv(OUTPUT_CSV, index=False)
+    print(f"\nSaved {len(df)} videos to {OUTPUT_CSV}")
+    print(df[["title", "views", "likes", "comments", "duration_minutes"]].head(10))
+
+    return df
+
+
+if __name__ == "__main__":
+    df = main()
